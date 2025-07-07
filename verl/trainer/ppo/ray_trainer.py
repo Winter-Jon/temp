@@ -29,12 +29,14 @@ from pprint import pprint
 from typing import Optional, Type
 
 import numpy as np
+import pandas as pd
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -44,7 +46,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
+    # compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -58,6 +60,10 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.trainer.buffer import Buffer
+
+import re
+from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
 
@@ -151,12 +157,15 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
-    if multi_turn:
-        loss_mask = data.batch["loss_mask"]
-        response_mask = loss_mask[:, -response_length:]
-    else:
-        attention_mask = data.batch["attention_mask"]
-        response_mask = attention_mask[:, -response_length:]
+    # if multi_turn:
+    #     loss_mask = data.batch["loss_mask"]
+    #     response_mask = loss_mask[:, -response_length:]
+    # else:
+    #     attention_mask = data.batch["attention_mask"]
+    #     response_mask = attention_mask[:, -response_length:]
+
+    attention_mask = data.batch['info_mask'] if 'info_mask' in data.batch else data.batch['attention_mask']
+    response_mask = attention_mask[:, -response_length:]
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
@@ -221,10 +230,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        ppo_calculation_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
+            response_mask=ppo_calculation_mask,
             gamma=gamma,
             lam=lam,
         )
@@ -237,14 +250,18 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 config.get("pf_ppo_weight_pow", 2.0),
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-        if multi_turn:
-            # If multi-turn, replace the mask with the relevant part of loss_mask
-            # Get length from the initial response mask
-            response_length = grpo_calculation_mask.size(1)
-            # This mask is the one intended for GRPO
-            grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+        # # Initialize the mask for GRPO calculation
+        # grpo_calculation_mask = data.batch["response_mask"]
+        # if multi_turn:
+        #     # If multi-turn, replace the mask with the relevant part of loss_mask
+        #     # Get length from the initial response mask
+        #     response_length = grpo_calculation_mask.size(1)
+        #     # This mask is the one intended for GRPO
+        #     grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        grpo_calculation_mask = attention_mask[:, -response_length:]
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -273,6 +290,304 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["returns"] = returns
     return data
 
+def update_revision_stats(final_gen_batch_output: DataProto, generation_manager: LLMGenerationManager, metrics: dict):
+    responses_ids = final_gen_batch_output.batch['responses']
+    responses_str = generation_manager.tokenizer.batch_decode(responses_ids.int(), skip_special_tokens=True)
+    new_trajectory_mask = [not original_mask for original_mask in final_gen_batch_output.batch['original_mask'].bool()]
+    new_trajectory = [trajectory for trajectory, mask in zip(responses_str, new_trajectory_mask) if mask]
+    actions_stats = {
+        'revision/new/retrieve': 0,
+        'revision/new/reflect': 0,
+        'revision/new/conflict-check': 0,
+        'revision/new/none': 0,
+        'revision/new/other': 0, # <action>中没有前面四种
+        'revision/new/invalid': 0, # 没有输出<action>
+        'revision/new/total': 0,
+    }
+    actions_stats['revision/new/total'] = len(new_trajectory)
+    for idx, trajectory in enumerate(new_trajectory):
+        pattern = r'<(action)>(.*?)</\1>'
+        match = re.search(pattern, trajectory, re.DOTALL)
+        if match:
+            action = match.group(1)
+            content = match.group(2).strip().strip('[').strip(']').lower()
+            if content in ['retrieve', 'reflect', 'conflict-check', 'none']:
+                actions_stats[f'revision/new/{content}'] += 1
+            else:
+                actions_stats['revision/new/other'] += 1
+        else:
+            actions_stats['revision/new/invalid'] += 1
+    for key in actions_stats.keys():
+        if key != 'revision/new/total':
+            actions_stats[key] = actions_stats[key] / actions_stats['revision/new/total'] if actions_stats['revision/new/total'] > 0 else 0
+    metrics.update(actions_stats)
+    old_trajectory_mask = [original_mask for original_mask in final_gen_batch_output.batch['original_mask'].bool()]
+    old_trajectory = [trajectory for trajectory, mask in zip(responses_str, old_trajectory_mask) if mask]
+    old_actions_stats = {
+        'revision/old/retrieve': 0,
+        'revision/old/reflect': 0,
+        'revision/old/conflict-check': 0,
+        'revision/old/none': 0,
+        'revision/old/other': 0, # <action>中没有前面四种
+        'revision/old/invalid': 0, # 没有输出<action>
+        'revision/old/total': 0,
+    }
+    old_actions_stats['revision/old/total'] = len(old_trajectory)
+    for idx, trajectory in enumerate(old_trajectory):
+        pattern = r'<(action)>(.*?)</\1>'
+        match = re.search(pattern, trajectory, re.DOTALL)
+        if match:
+            content = match.group(1).strip().strip('[').strip(']').lower()
+            if content in ['retrieve', 'reflect', 'conflict-check', 'none']:
+                old_actions_stats[f'revision/old/{content}'] += 1
+            else:
+                old_actions_stats['revision/old/other'] += 1
+        else:
+            old_actions_stats['revision/old/invalid'] += 1
+    for key in old_actions_stats.keys():
+        if key != 'revision/old/total':
+            old_actions_stats[key] = old_actions_stats[key] / old_actions_stats['revision/old/total'] if old_actions_stats['revision/old/total'] > 0 else 0
+    metrics.update(old_actions_stats)
+    return metrics
+
+
+def update_kl_stats(batch: DataProto, metrics: dict, generation_manager: LLMGenerationManager):
+    # 检查clone 出来的轨迹在 old_log_prob 和 ref_log_prob 的差距
+    # 检查规上不同部分的优势
+    '''
+      分别计算: 
+        1. 整条轨迹的 KL 散度 
+        2. 插入提示此前的 KL 散度 
+        3. revision提示词的 KL 散度 
+        4. invalid action提示词的 KL 散度
+        5. 检索器返回的 information 的 KL 散度 
+    '''
+    # ref_log_prob & old_log_prob
+    responses_length = batch.batch['responses'].shape[-1]
+    component_mask = batch.batch['component_mask'][:, -responses_length:]
+    old_log_prob_tensors = batch.batch['old_log_probs'][:, -responses_length:]
+    ref_log_prob_tensors = batch.batch['ref_log_prob'][:, -responses_length:]
+    bsz = component_mask.shape[0]
+    # 计算整条轨迹的 KL 散度
+    full_trajectory_mask = component_mask != generation_manager.tokenizer.pad_token_id
+    # 计算提示词前的 KL 散度
+    model_response_mask = component_mask == 1
+    padded = torch.cat([model_response_mask, torch.zeros((bsz,1),dtype=model_response_mask.dtype,device=model_response_mask.device)],dim = 1)
+    end_true_block_model_response = (padded[:,:-1] & ~padded[:,1:])
+    idx_of_first_true_block = torch.argmax(end_true_block_model_response.int(),dim = 1)
+    arange = torch.arange(responses_length,device=idx_of_first_true_block.device).unsqueeze(0).expand(bsz,-1)
+    first_true_block_mask = model_response_mask & (arange < idx_of_first_true_block.unsqueeze(1))
+    # revision and action 提示词的 KL 散度
+    revision_mask = component_mask == 5
+    action_mask = component_mask == 6
+    # invalid action 提示词的 KL 散度
+    invalid_action_mask = component_mask == 3
+    # 检索器返回的 information 的 KL 散度
+    info_mask = component_mask == 4
+    kl = old_log_prob_tensors - ref_log_prob_tensors
+    full_trajectory_kl = kl * full_trajectory_mask.float()
+    first_true_block_kl = kl * first_true_block_mask.float()
+    revision_kl = kl * revision_mask.float()
+    action_kl = kl * action_mask.float()
+    invalid_action_kl = kl * invalid_action_mask.float()
+    info_kl = kl * info_mask.float()
+    # num_of_original_seq = batch.batch['original_mask'].sum()
+    # num_of_clone_seq = (~batch.batch['original_mask']).sum()
+    original_mask = batch.batch['original_mask'].bool()
+    clone_mask = ~original_mask
+    metrics.update({
+        'KL_div/orginal/full_trajectory': full_trajectory_kl[original_mask].mean(),
+        'KL_div/orginal/first_true_block': first_true_block_kl[original_mask].mean(),
+        'KL_div/orginal/revision': revision_kl[original_mask].mean(),
+        'KL_div/orginal/action': action_kl[original_mask].mean(),
+        'KL_div/orginal/invalid_action': invalid_action_kl[original_mask].mean(),
+        'KL_div/orginal/info': info_kl[original_mask].mean(),
+        'KL_div/clone/full_trajectory': full_trajectory_kl[clone_mask].mean(),
+        'KL_div/clone/first_true_block': first_true_block_kl[clone_mask].mean(),
+        'KL_div/clone/revision': revision_kl[clone_mask].mean(),
+        'KL_div/clone/action': action_kl[clone_mask].mean(),
+        'KL_div/clone/invalid_action': invalid_action_kl[clone_mask].mean(),
+        'KL_div/clone/info': info_kl[clone_mask].mean(),
+    })
+    adv_tensors = batch.batch['advantages']
+    adv_of_full_trajectory = adv_tensors * full_trajectory_mask.float()
+    adv_of_first_true_block = adv_tensors * first_true_block_mask.float()
+    adv_of_revision = adv_tensors * revision_mask.float()
+    adv_of_action = adv_tensors * action_mask.float()
+    adv_of_invalid_action = adv_tensors * invalid_action_mask.float()
+    adv_of_info = adv_tensors * info_mask.float()
+    metrics.update({
+        'Adv/orginal/full_trajectory': adv_of_full_trajectory[original_mask].mean(),
+        'Adv/orginal/first_true_block': adv_of_first_true_block[original_mask].mean(),
+        'Adv/orginal/revision': adv_of_revision[original_mask].mean(),
+        'Adv/orginal/action': adv_of_action[original_mask].mean(),
+        'Adv/orginal/invalid_action': adv_of_invalid_action[original_mask].mean(),
+        'Adv/orginal/info': adv_of_info[original_mask].mean(),
+        'Adv/clone/full_trajectory': adv_of_full_trajectory[clone_mask].mean(),
+        'Adv/clone/first_true_block': adv_of_first_true_block[clone_mask].mean(),
+        'Adv/clone/revision': adv_of_revision[clone_mask].mean(),
+        'Adv/clone/action': adv_of_action[clone_mask].mean(),
+        'Adv/clone/invalid_action': adv_of_invalid_action[clone_mask].mean(),
+        'Adv/clone/info': adv_of_info[clone_mask].mean(),
+    })
+
+    return metrics
+
+def _compute_response_info(batch):
+    response_length = batch.batch['responses'].shape[-1]
+
+    prompt_mask = batch.batch['attention_mask'][:, :-response_length]
+    response_mask = batch.batch['attention_mask'][:, -response_length:]
+
+    prompt_length = prompt_mask.sum(-1).float()
+    response_length = response_mask.sum(-1).float()  # (batch_size,)
+
+    return dict(
+        response_mask=response_mask,
+        prompt_length=prompt_length,
+        response_length=response_length,
+    )
+
+
+def compute_data_metrics(batch, use_critic=True):
+    # TODO: add response length
+    sequence_score = batch.batch['token_level_scores'].sum(-1)
+    sequence_reward = batch.batch['token_level_rewards'].sum(-1)
+
+    advantages = batch.batch['advantages']
+    returns = batch.batch['returns']
+
+    max_response_length = batch.batch['responses'].shape[-1]
+
+    prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
+    response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
+
+    max_prompt_length = prompt_mask.size(-1)
+
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info['prompt_length']
+    response_length = response_info['response_length']
+
+    valid_adv = torch.masked_select(advantages, response_mask)
+    valid_returns = torch.masked_select(returns, response_mask)
+
+    if use_critic:
+        values = batch.batch['values']
+        valid_values = torch.masked_select(values, response_mask)
+        return_diff_var = torch.var(valid_returns - valid_values)
+        return_var = torch.var(valid_returns)
+
+    metrics = {
+        # score
+        'critic/score/mean':
+            torch.mean(sequence_score).detach().item(),
+        'critic/score/max':
+            torch.max(sequence_score).detach().item(),
+        'critic/score/min':
+            torch.min(sequence_score).detach().item(),
+        # reward
+        'critic/rewards/mean':
+            torch.mean(sequence_reward).detach().item(),
+        'critic/rewards/max':
+            torch.max(sequence_reward).detach().item(),
+        'critic/rewards/min':
+            torch.min(sequence_reward).detach().item(),
+        # adv
+        'critic/advantages/mean':
+            torch.mean(valid_adv).detach().item(),
+        'critic/advantages/max':
+            torch.max(valid_adv).detach().item(),
+        'critic/advantages/min':
+            torch.min(valid_adv).detach().item(),
+        # returns
+        'critic/returns/mean':
+            torch.mean(valid_returns).detach().item(),
+        'critic/returns/max':
+            torch.max(valid_returns).detach().item(),
+        'critic/returns/min':
+            torch.min(valid_returns).detach().item(),
+        **({
+            # values
+            'critic/values/mean': torch.mean(valid_values).detach().item(),
+            'critic/values/max': torch.max(valid_values).detach().item(),
+            'critic/values/min': torch.min(valid_values).detach().item(),
+            # vf explained var
+            'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+        } if use_critic else {}),
+
+        # response length
+        'response_length/mean':
+            torch.mean(response_length).detach().item(),
+        'response_length/max':
+            torch.max(response_length).detach().item(),
+        'response_length/min':
+            torch.min(response_length).detach().item(),
+        'response_length/clip_ratio':
+            torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        # prompt length
+        'prompt_length/mean':
+            torch.mean(prompt_length).detach().item(),
+        'prompt_length/max':
+            torch.max(prompt_length).detach().item(),
+        'prompt_length/min':
+            torch.min(prompt_length).detach().item(),
+        'prompt_length/clip_ratio':
+            torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+    }
+
+    # metrics for actions
+    if 'turns_stats' in batch.meta_info:
+        metrics['env/number_of_actions/mean'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.int16).mean())
+        metrics['env/number_of_actions/max'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.int16).max())
+        metrics['env/number_of_actions/min'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.int16).min())
+    if 'active_mask' in batch.meta_info:
+        metrics['env/finish_ratio'] = 1 - float(np.array(batch.meta_info['active_mask'], dtype=np.int16).mean())
+    if 'valid_action_stats' in batch.meta_info:
+        metrics['env/number_of_valid_action'] = float(np.array(batch.meta_info['valid_action_stats'], dtype=np.int16).mean())
+        metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
+    if 'valid_search_stats' in batch.meta_info:
+        metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+
+
+    return metrics
+
+def reorder_batch(config, batch, keep_ratio = None):
+    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
+    # 仅保留 trainer.train_batch * rollout.n_agent * 8%
+    # keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * config.keep_ratio)
+    keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * keep_ratio)
+    keep_num = keep_num - (keep_num % config.trainer.n_gpus_per_node)
+    # old_log_prob = batch.batch["old_log_prob"].detach().cpu().numpy().mean(axis = 1)
+    batch_batch_orignal = {}
+    batch_batch_clone = {}
+    original_mask = batch.batch['original_mask'].bool()
+    for k,v in batch.batch.items():
+        batch_batch_orignal[k] = v[original_mask]
+        batch_batch_clone[k] = v[~original_mask]
+    batch_non_tensor_orignal = {}
+    batch_non_tensor_clone = {}
+    for k,v in batch.non_tensor_batch.items():
+        batch_non_tensor_orignal[k] = v[original_mask]
+        batch_non_tensor_clone[k] = v[~original_mask]
+    prompt_mask = ((batch_batch_clone['component_mask'] == 5) | (batch_batch_clone['component_mask'] == 6))[:, -batch_batch_clone['responses'].shape[-1]:]
+    masked_old_log_prob = batch_batch_clone["old_log_probs"] * prompt_mask
+    count = prompt_mask.sum(dim = 1)
+    old_log_prob = masked_old_log_prob.sum(dim = 1) / count.clamp(min = 1)
+    old_log_prob = old_log_prob.detach().cpu().numpy()
+    sorted_idx = np.argsort(-old_log_prob)[:keep_num]
+    for k,v in batch_batch_clone.items():
+        batch_batch_clone[k] = v[sorted_idx]
+    for k,v in batch_non_tensor_clone.items():
+        batch_non_tensor_clone[k] = v[sorted_idx]
+    batch_batch = {}
+    batch_non_tensor = {}
+    for k in batch_batch_orignal.keys():
+        batch_batch[k] = torch.cat([batch_batch_orignal[k], batch_batch_clone[k]], dim=0)
+    for k in batch_non_tensor_orignal.keys():
+        batch_non_tensor[k] = np.concatenate([batch_non_tensor_orignal[k], batch_non_tensor_clone[k]], axis=0)
+    batch.batch = TensorDict(batch_batch, batch_size=original_mask.sum().item()+batch_batch_clone["old_log_probs"].shape[0])
+    batch.non_tensor_batch = batch_non_tensor
+    return batch
 
 class RayPPOTrainer:
     # TODO: support each role have individual ray_worker_group_cls,
@@ -605,6 +920,26 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
+        gen_config = GenerationConfig(
+                max_turns=self.config.max_turns,
+                max_start_length=self.config.data.max_start_length,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                max_obs_length=self.config.data.max_obs_length,
+                num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+                no_think_rl=self.config.algorithm.no_think_rl,
+                search_url = self.config.retriever.url,
+                topk = self.config.retriever.topk,
+            )
+
+        generation_manager = LLMGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                revision_prob=0,
+                is_validation=True,
+            )    
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -643,13 +978,22 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")       
 
             # pad to be divisible by dp_size
             size_divisor = self.actor_rollout_wg.world_size if not self.async_rollout_mode else self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                if self.config.do_search:
+                    first_input_ids = test_gen_batch_padded.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+                    test_output_gen_batch_padded,_ = generation_manager.run_llm_loop(
+                        gen_batch=test_gen_batch_padded,
+                        initial_input_ids=first_input_ids,
+                        is_validation=True,
+                    )
+                    
+                else:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
@@ -658,14 +1002,18 @@ class RayPPOTrainer:
             print("validation generation end")
 
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
+            output_ids = test_output_gen_batch.batch["responses"].int()
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
 
+            for key in test_batch.batch.keys():
+                test_batch.batch[key] = test_batch.batch[key].long()
+
             # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
+            # result = self.val_reward_fn(test_batch, return_dict=True)
+            result = self.val_reward_fn(test_batch)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -696,20 +1044,24 @@ class RayPPOTrainer:
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
+        metric_dict = defaultdict(list)
+        for data_source, reward in zip(data_sources, reward_extra_infos_dict["reward"]):
+            metric_dict[f'val/{data_source}'].append(reward)
+        metric_dict = {k: np.mean(v) for k, v in metric_dict.items()}
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (var_name == core_var) and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}" in metric_name):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+        # data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        # metric_dict = {}
+        # for data_source, var2metric2val in data_src2var2metric2val.items():
+        #     core_var = "acc" if "acc" in var2metric2val else "reward"
+        #     for var_name, metric2val in var2metric2val.items():
+        #         n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+        #         for metric_name, metric_val in metric2val.items():
+        #             if (var_name == core_var) and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}" in metric_name):
+        #                 metric_sec = "val-core"
+        #             else:
+        #                 metric_sec = "val-aux"
+        #             pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+        #             metric_dict[pfx] = metric_val
 
         return metric_dict
 
@@ -855,6 +1207,8 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
+                # if self.config.trainer.get("use_buffer", False):
+                #     self.buffer = Buffer(capacity = self.config.trainer.train_batch_size)
                 return 0
         else:
             if self.config.trainer.resume_mode == "resume_path":
@@ -870,6 +1224,9 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        # if self.config.trainer.get("use_buffer", False):
+        #     self.buffer = Buffer.load_from_file(global_step_folder)
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
@@ -942,6 +1299,29 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        gen_config = GenerationConfig(
+            max_turns=self.config.max_turns,
+            max_start_length=self.config.data.max_start_length,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_response_length=self.config.data.max_response_length,
+            max_obs_length=self.config.data.max_obs_length,
+            num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+            no_think_rl=self.config.algorithm.no_think_rl,
+            search_url = self.config.retriever.url,
+            topk = self.config.retriever.topk,
+            # rollout_times = self.config.data.rollout_times,
+            # max_revision_times = self.config.data.max_revision_times,
+        )
+
+        generation_manager = LLMGenerationManager(
+            tokenizer=self.tokenizer,
+            actor_rollout_wg=self.actor_rollout_wg,
+            config=gen_config,
+            revision_prob=self.config.data.revision_prob,
+        )
+
+        revision_accs = np.array([self.config.keep_ratio])
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
@@ -958,6 +1338,8 @@ class RayPPOTrainer:
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -973,18 +1355,36 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                gen_batch_info = batch.select(non_tensor_batch_keys=['reward_model', 'data_source'])
+                gen_batch = gen_batch.union(gen_batch_info)
 
                 is_last_step = self.global_steps >= self.total_training_steps
-
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            if self.config.do_search:
+                                first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
+                                generation_manager.timing_raw = timing_raw
+                                final_gen_batch_output,clone_rollout_index = generation_manager.run_llm_loop(
+                                    gen_batch=gen_batch,
+                                    initial_input_ids=first_input_ids,
+                                    steps=self.global_steps,
+                                )
+                                metrics = update_revision_stats(final_gen_batch_output, generation_manager, metrics)
+                                for key in final_gen_batch_output.batch.keys():
+                                    final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
+                                batch.batch = TensorDict({}, batch_size=final_gen_batch_output.batch.shape)
+                                for key in batch.non_tensor_batch.keys():
+                                    batch.non_tensor_batch[key] = np.concatenate([batch.non_tensor_batch[key], batch.non_tensor_batch[key][clone_rollout_index]], axis=0)
+                            else:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        # timing_raw.update(gen_batch_output.meta_info["timing"])
+                        # gen_batch_output.meta_info.pop("timing", None)
+                        timing_raw.update(final_gen_batch_output.meta_info["timing"])
+                        final_gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1002,10 +1402,23 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    # batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    # batch = batch.union(gen_batch_output)
+                    batch = batch.union(final_gen_batch_output)
+                    # delete_size = batch.batch.batch_size[0] % self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    delete_size = batch.batch.batch_size[0] % self.config.trainer.n_gpus_per_node
+                    if delete_size > 0:
+                        batch_batch = {}
+                        for k,v in batch.batch.items():
+                            batch_batch[k] = v[:-delete_size]
+                        batch.batch = TensorDict(batch_batch, batch_size=batch.batch.batch_size[0] - delete_size)
+                        batch_non_tensor_batch = {}
+                        for k,v in batch.non_tensor_batch.items():
+                            batch_non_tensor_batch[k] = v[:-delete_size]
+                        batch.non_tensor_batch = batch_non_tensor_batch
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1018,17 +1431,6 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1066,6 +1468,32 @@ class RayPPOTrainer:
                                 }
                             )
 
+                    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
+                    ratio_keep = pd.Series(revision_accs).ewm(alpha=0.1,adjust=False).mean().iloc[-1]
+                    batch = reorder_batch(self.config,batch, keep_ratio = ratio_keep)
+                    metrics.update({
+                        "revision/keep_ratio": ratio_keep,
+                    })
+
+                    # NOTE: 记录克隆轨迹的数量和 token 占比，用于后续的 IS 计算
+                    batch.meta_info["cloned_traj_num"] = batch.batch.batch_size[0] - batch.batch['original_mask'].sum().item()
+                    batch.meta_info["cloned_traj_ratio"] = batch.meta_info["cloned_traj_num"] / batch.batch.batch_size[0]
+                    revision_tokens = (batch.batch["component_mask"] == 5).sum().item()
+                    action_tokens = (batch.batch["component_mask"] == 6).sum().item()
+                    respones_tokens = (batch.batch["component_mask"] == 1).sum().item()
+                    batch.meta_info["prompts_token_ratio"] =  (revision_tokens + action_tokens)/(revision_tokens + action_tokens +respones_tokens)
+
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm:
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        if self.config.reward_model.launch_reward_fn_async:
+                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                        else:
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -1088,8 +1516,32 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        temp_dict = defaultdict(list)
+                        for dic in reward_extra_infos_dict['reward_extra_info']:
+                            for k,v in dic.items():
+                                temp_dict[k].append(v)
+                        for key, value in temp_dict.items():
+                            metrics[f'format_detail/{key}'] = np.mean(value)
+
+                        original_mask = batch.batch['original_mask'].bool()
+                        clone_mask = ~original_mask
+                        original_acc = (batch.batch['token_level_scores'].sum(-1)[original_mask] >= 1.0).sum() / original_mask.sum()
+                        revision_acc = (batch.batch['token_level_scores'].sum(-1)[clone_mask] >= 1.0).sum() / clone_mask.sum() if clone_mask.sum() > 0 else 0
+                        overall_acc = (batch.batch['token_level_scores'].sum(-1) >= 1.0).sum() / original_mask.shape[0]
+                        metrics.update({
+                            'Acc/original': original_acc,
+                            'Acc/revision': revision_acc,
+                            'Acc/overall': overall_acc,
+                        })
+
+                        batch.meta_info["acc"] = original_acc
+
+                        revision_accs = np.append(revision_accs, revision_acc)
+
+                        
+
+                        # if reward_extra_infos_dict:
+                        #     batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1109,9 +1561,12 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                            # multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                            multi_turn=True,
                             config=self.config.algorithm,
                         )
+
+                        metrics = update_kl_stats(batch, metrics, generation_manager)
 
                     # update critic
                     if self.use_critic:
@@ -1119,12 +1574,14 @@ class RayPPOTrainer:
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                                batch, metrics = self._create_loss_mask(batch, metrics)
+                            # batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            batch.meta_info["multi_turn"] = True
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1133,7 +1590,7 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            print(batch.batch.keys())
+                            # print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1195,3 +1652,18 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+
+    def _create_loss_mask(self, batch, metrics):
+        """Create loss mask for state tokens."""
+        response_length = batch.batch['responses'].shape[-1]
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        
+        loss_mask = batch.batch['info_mask'][:, -response_length:]
+        batch.batch['loss_mask'] = loss_mask
+
+        metrics.update({
+            'state_tokens/total': loss_mask.sum().item(),
+            'state_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
+        })
+        
+        return batch, metrics

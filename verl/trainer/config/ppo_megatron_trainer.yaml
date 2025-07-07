@@ -6,6 +6,10 @@ data:
   reward_fn_key: data_source
   max_prompt_length: 512
   max_response_length: 512
+  max_start_length: 1024
+  max_obs_length: 500
+  revision_prob: 0
+  structure_format_score: 0
   train_batch_size: 1024
   val_batch_size: null # DEPRECATED: Validation datasets are sent to inference engines as a whole batch, which will schedule the memory themselves
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -46,7 +50,7 @@ actor_rollout_ref:
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
-    use_dynamic_bsz: False
+    use_dynamic_bsz: True
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     use_torch_compile: True # False to disable torch compile
     # pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
@@ -186,6 +190,7 @@ actor_rollout_ref:
       gate_proj_layer_name: gate_up
     # number of responses (i.e. num sample times)
     n: 1
+    n_agent: 1
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
@@ -383,6 +388,7 @@ custom_reward_function:
   name: compute_score
 
 algorithm:
+  no_think_rl: false
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
@@ -443,3 +449,10 @@ trainer:
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
   timeline_json_file: null
+
+retriever:
+  url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+
+max_turns: 5
+do_search: true

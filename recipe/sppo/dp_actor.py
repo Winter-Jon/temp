@@ -67,8 +67,8 @@ class DataParallelSPPOActor(DataParallelPPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "seq_level_rewards"]
-        if multi_turn:
-            select_keys.append("loss_mask")
+        # if multi_turn:
+        select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
@@ -111,10 +111,11 @@ class DataParallelSPPOActor(DataParallelPPOActor):
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
-                    if multi_turn:
-                        response_mask = data["loss_mask"][:, -response_length:]
-                    else:
-                        response_mask = attention_mask[:, -response_length:]
+                    # if multi_turn:
+                    #     response_mask = data["loss_mask"][:, -response_length:]
+                    # else:
+                    #     response_mask = attention_mask[:, -response_length:]
+                    response_mask = data["loss_mask"][:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
                     rewards = data["seq_level_rewards"]

@@ -431,6 +431,16 @@ class DataProto:
             sub_meta_info = copy.deepcopy(sub_meta_info)
 
         return type(self)(batch=sub_batch, non_tensor_batch=non_tensor_batch, meta_info=sub_meta_info)
+        
+    def clone(self,index: Union[int, List[int]]) -> 'DataProto':
+        """
+        实现根据索引复制数据，并返回新的DataProto
+        """
+        if isinstance(index, int):
+            index = [index]
+        new_batch = TensorDict({key: val[index].clone().detach() for key, val in self.batch.items()},batch_size=len(index))
+        new_non_tensor_batch = {key: val[index].copy() for key, val in self.non_tensor_batch.items()}
+        return DataProto(batch=new_batch, non_tensor_batch=new_non_tensor_batch, meta_info=self.meta_info)
 
     def select_idxs(self, idxs):
         """

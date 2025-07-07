@@ -362,8 +362,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        # alpha = data.meta_info.get("prompts_token_ratio", 0.0)
+        alpha = data.meta_info["cloned_traj_ratio"]
+        error_rate = 1 - data.meta_info['acc']
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys.append("original_mask")
+        select_keys.append("component_mask")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -436,6 +441,41 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
+
+                    # NOTE: 根据重要性采样系数，修改 old_log_prob
+                    # q(a|s) = (1-\alpha) * \pi_{old}(a|s) + \alpha * \mu(a|s)
+                    # 其中，在插入的提示词上，\mu(prompt_0|s) = 1/30 , 在其他位置上，\mu(prompt_others|s) = 1/30 ，\mu(action|s) = old_log_prob
+                    # 1.
+                    # mu_prob = torch.zeros_like(old_log_prob)
+                    # 2.
+                    # mu_prob = torch.exp(old_log_prob.detach().clone())
+                    # 3. 
+                    # mu_prob = torch.exp(old_log_prob.detach().clone()) * (1-data["original_mask"].unsqueeze(1).to(old_log_prob.dtype))
+                    # old_log_prob = old_log_prob * (data["original_mask"].unsqueeze(1).to(old_log_prob.dtype))
+                    # 4. 如果是\mu的轨迹在整个\pi_old 的空间中占 beta. 每个 token 的 prob 都应该是 \sqrt[len(seq)]{beta} * \pi_old(token|s)
+                    # 这样连乘起来，整个轨迹的概率 beta * \pi_old(seq)
+                    # 每个轨迹都要除以归一化系数 z, 每个 token 都要除以 \sqrt[len(seq)]{z}
+                    mu_prob = torch.exp(old_log_prob.detach().clone()) * (1-data["original_mask"].unsqueeze(1).to(old_log_prob.dtype))
+
+                    revision_mask = (data["component_mask"] == 5)[:, -response_length:]
+                    # action_mask = (data["component_mask"] == 6)[:, -response_length:]
+                    revision_cumsum = revision_mask.cumsum(dim=1)
+                    # action_cumsum = action_mask.cumsum(dim=1)
+                    revision_first_token_mask = (revision_mask & (revision_cumsum == 1))
+                    # action_first_token_mask = (action_mask & (action_cumsum == 1))
+                    mu_prob[revision_mask] = 1
+                    # mu_prob[action_mask] = 1
+                    mu_prob[revision_first_token_mask] = 1/30
+                    # mu_prob[action_first_token_mask] = 1/30
+
+                    revision_first_token_indices = revision_first_token_mask.nonzero(as_tuple=True)
+                    for i, j in zip(*revision_first_token_indices):
+                        mu_prob[i, :j] /= torch.tensor(error_rate, dtype=mu_prob.dtype).pow(1/j)
+
+                    ori_old_log_prob = old_log_prob.clone().detach()
+                    old_log_prob = torch.where(data["attention_mask"][:, -response_length:].bool(), torch.log(torch.exp(old_log_prob) * (1-alpha) + mu_prob * alpha), ori_old_log_prob)
+
+
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -454,7 +494,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, clip_mask = compute_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
@@ -494,11 +534,44 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
+                    # NOTE: 计算clone 出的轨迹的各个部分的 token 被梯度截断的比例
+                    original_mask = data["original_mask"].bool()
+                    component_mask = data["component_mask"][:, -response_length:]
+
+                    original_full_trajectory_clip_frac = clip_mask[original_mask].float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    clone_full_trajectory_clip_frac = clip_mask[~original_mask].float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+
+                    original_response_clip_frac = (clip_mask[original_mask] & (component_mask[original_mask] == 1)).float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    original_revision_clip_frac = (clip_mask[original_mask] & (component_mask[original_mask] == 5)).float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    original_action_clip_frac = (clip_mask[original_mask] & (component_mask[original_mask] == 6)).float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    original_invalid_action_clip_frac = (clip_mask[original_mask] & (component_mask[original_mask] == 3)).float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    original_search_clip_frac = (clip_mask[original_mask] & (component_mask[original_mask] == 4)).float().mean() if (original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+
+                    clone_response_clip_frac = (clip_mask[~original_mask] & (component_mask[~original_mask] == 1)).float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    clone_revision_clip_frac = (clip_mask[~original_mask] & (component_mask[~original_mask] == 5)).float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    clone_action_clip_frac = (clip_mask[~original_mask] & (component_mask[~original_mask] == 6)).float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    clone_invalid_action_clip_frac = (clip_mask[~original_mask] & (component_mask[~original_mask] == 3)).float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+                    clone_search_clip_frac = (clip_mask[~original_mask] & (component_mask[~original_mask] == 4)).float().mean() if (~original_mask).any() else torch.tensor(0.0, device=pg_loss.device)
+
+                    # clip_frac_stats["analysis/original/full_trajectory_clip_frac"] = 
+
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        "analysis/original/full_trajectory_clip_frac": original_full_trajectory_clip_frac.detach().item(),
+                        "analysis/clone/full_trajectory_clip_frac": clone_full_trajectory_clip_frac.detach().item(),
+                        "analysis/original/response_clip_frac": original_response_clip_frac.detach().item(),
+                        "analysis/original/revision_clip_frac": original_revision_clip_frac.detach().item(),
+                        "analysis/original/action_clip_frac": original_action_clip_frac.detach().item(),
+                        "analysis/original/invalid_action_clip_frac": original_invalid_action_clip_frac.detach().item(),
+                        "analysis/original/search_clip_frac": original_search_clip_frac.detach().item(),
+                        "analysis/clone/response_clip_frac": clone_response_clip_frac.detach().item(),
+                        "analysis/clone/revision_clip_frac": clone_revision_clip_frac.detach().item(),
+                        "analysis/clone/action_clip_frac": clone_action_clip_frac.detach().item(),
+                        "analysis/clone/invalid_action_clip_frac": clone_invalid_action_clip_frac.detach().item(),
+                        "analysis/clone/search_clip_frac": clone_search_clip_frac.detach().item(),
                     }
                     append_to_dict(metrics, data)
 

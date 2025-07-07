@@ -18,6 +18,12 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
+.triton/
+.log
+verl_checkpoints/
+sota模型/
+.vscode/
+data/
 
 # Distribution / packaging
 .Python

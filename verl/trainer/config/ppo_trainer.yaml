@@ -6,6 +6,10 @@
 
 # dataset config
 data:
+  max_start_length: 1024
+  max_obs_length: 500
+  revision_prob: 0
+  structure_format_score: 0
 
   # Tokenizer class or path. If null, it will be inferred from the model.
   tokenizer: null
@@ -148,6 +152,7 @@ actor_rollout_ref:
 
   # actor configs
   actor:
+    state_masking: true
 
     # fsdp, fsdp2 or megatron. fsdp backend used here.
     strategy: fsdp
@@ -380,6 +385,7 @@ actor_rollout_ref:
 
   # Rollout model config.
   rollout:
+    n_agent: 5
 
     # actor_rollout_ref.rollout.name: hf/vllm/sglang.
     name: vllm
@@ -859,6 +865,7 @@ custom_reward_function:
 
 # config for the algorithm
 algorithm:
+  no_think_rl: false
 
   # Discount factor for future rewards
   gamma: 1.0
@@ -1040,3 +1047,14 @@ ray_init:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+retriever:
+  url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+
+max_turns: 5
+do_search: true
+keep_ratio: 0.08
+
+use_buffer: false
+use_ls_factor: false
