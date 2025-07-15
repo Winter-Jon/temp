@@ -204,6 +204,7 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: str = True,
+    threshold: float = 1e-6,
 ):
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -235,24 +236,27 @@ def compute_grpo_outcome_advantage(
         bsz = scores.shape[0]
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
+        num_leq_threshold = 0
         for idx in id2score:
-            if len(id2score[idx]) == 1:
+            group_scores = torch.tensor(id2score[idx])
+            if len(group_scores) == 1:
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            elif len(group_scores) > 1:
+                id2mean[idx] = torch.mean(group_scores)
+                id2std[idx] = torch.std(group_scores)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+            if threshold is not None:
+                if torch.all(group_scores < threshold):
+                    num_leq_threshold += 1
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
-
-    return scores, scores
-
+        return scores, scores, num_leq_threshold
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(

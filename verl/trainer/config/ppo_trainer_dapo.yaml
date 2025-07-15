@@ -183,7 +183,7 @@ actor_rollout_ref:
     clip_ratio_low: 0.2
 
     # Upper bound for asymmetric clipping (used in dual-clip PPO)
-    clip_ratio_high: 0.2
+    clip_ratio_high: 0.28
 
     # policy loss config
     policy_loss:
@@ -1058,12 +1058,3 @@ keep_ratio: 0.08
 
 use_buffer: false
 use_ls_factor: false
-
-dapo:
-  enable: false
-  overlong_buffer_cfg:
-    enable: false
-    len: 820
-    penalty_factor: 1.0
-  dynamic_sampling:
-    enable: false

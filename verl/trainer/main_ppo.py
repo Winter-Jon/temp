@@ -17,12 +17,13 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+import random
 
 import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, RayDAPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl import DataProto
 from collections import defaultdict
@@ -41,11 +42,13 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0., structure_format_score=0.) -> None:
+    def __init__(self, tokenizer, num_examine, format_score=0., structure_format_score=0., overlong_buffer_cfg=None, max_response_length=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.structure_format_score = structure_format_score
+        self.overlong_buffer_cfg = overlong_buffer_cfg
+        self.max_response_length = max_response_length
 
     def __call__(self, data: DataProto, format_detail = False):
         """We will expand this function gradually based on the available datasets"""
@@ -92,6 +95,14 @@ class RewardManager():
 
             for key, value in format_score_detail.items():
                 format_detail_dict[key].append(value)
+            # NOTE: 在 DAPO 的训练阶段使用
+            if self.overlong_buffer_cfg is not None:
+                overlong_buffer_len = self.overlong_buffer_cfg.len
+                expected_len = self.max_response_length - overlong_buffer_len
+                exceed_len = valid_response_length - expected_len
+                overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
+                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+                score += overlong_reward
 
             # # 如果 original_mask 为 False，则 score 加 0.2
             # if original_mask is not None and not original_mask[i]:
@@ -256,6 +267,7 @@ class TaskRunner:
         # Load the reward manager for training and validation.
         # reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         # val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+        # reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, structure_format_score=config.data.structure_format_score, overlong_buffer_cfg=config.dapo.overlong_buffer_cfg if config.dapo.enable else None, max_response_length=config.data.max_prompt_length if config.dapo.enable else None)
         reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, structure_format_score=config.data.structure_format_score)
 
         # Note that we always use function-based RM for validation
@@ -270,6 +282,23 @@ class TaskRunner:
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
+        # if config.dapo.enable:
+        #     trainer = RayDAPOTrainer(
+        #         config=config,
+        #         tokenizer=tokenizer,
+        #         processor=processor,
+        #         role_worker_mapping=role_worker_mapping,
+        #         resource_pool_manager=resource_pool_manager,
+        #         ray_worker_group_cls=ray_worker_group_cls,
+        #         reward_fn=reward_fn,
+        #         val_reward_fn=val_reward_fn,
+        #         train_dataset=train_dataset,
+        #         val_dataset=val_dataset,
+        #         collate_fn=collate_fn,
+        #         train_sampler=train_sampler,
+        #         device_name=config.trainer.device,
+        #     )
+        # else:
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,

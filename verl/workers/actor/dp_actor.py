@@ -37,6 +37,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.exploration_distribution import PrefixIndex
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -78,6 +79,8 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+        self.prefix_index = PrefixIndex()
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -441,7 +444,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
-
+                    """
                     # NOTE: 根据重要性采样系数，修改 old_log_prob
                     # q(a|s) = (1-\alpha) * \pi_{old}(a|s) + \alpha * \mu(a|s)
                     # 其中，在插入的提示词上，\mu(prompt_0|s) = 1/30 , 在其他位置上，\mu(prompt_others|s) = 1/30 ，\mu(action|s) = old_log_prob
@@ -462,11 +465,41 @@ class DataParallelPPOActor(BasePPOActor):
                     revision_cumsum = revision_mask.cumsum(dim=1)
                     # action_cumsum = action_mask.cumsum(dim=1)
                     revision_first_token_mask = (revision_mask & (revision_cumsum == 1))
+
+                    # 5. 使用完全的 prefix index 来计算 mu_prob
+                    mu_prob[revision_first_token_mask] = 1
+
+                    b_idx, t_idx = revision_mask.nonzero(as_tuple=True)
+                    first_b, first_t = revision_first_token_mask.nonzero(as_tuple=True)
+                    first_pos_dict = {b.item(): t.item() for b, t in zip(first_b, first_t)}
+
+                    pairs_prefix, pairs_target, assign_b, assign_t = [], [], [], []
+                    for b, t in zip(b_idx.tolist(), t_idx.tolist()):
+                        if t == first_pos_dict[b]:          # 跳过首 token（已在 Step-0 赋值）
+                            continue
+                        prefix_ids = responses[b, first_pos_dict[b]:t].tolist()  # 1) 取前缀
+                        target_id  = responses[b, t].item()                     # 2) 当前 token
+                        pairs_prefix.append(prefix_ids)
+                        pairs_target.append(target_id)
+                        assign_b.append(b)
+                        assign_t.append(t)
+
+                    scores = [
+                        self.prefix_index.query(p, tgt)
+                        for p, tgt in zip(pairs_prefix, pairs_target)
+                    ]
+
+                    mu_prob[assign_b, assign_t] = torch.tensor(
+                        scores, dtype=mu_prob.dtype, device=mu_prob.device
+                    )
+
+                    '''
                     # action_first_token_mask = (action_mask & (action_cumsum == 1))
                     mu_prob[revision_mask] = 1
                     # mu_prob[action_mask] = 1
                     mu_prob[revision_first_token_mask] = 1/30
                     # mu_prob[action_first_token_mask] = 1/30
+                    '''
 
                     revision_first_token_indices = revision_first_token_mask.nonzero(as_tuple=True)
                     for i, j in zip(*revision_first_token_indices):
@@ -474,7 +507,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     ori_old_log_prob = old_log_prob.clone().detach()
                     old_log_prob = torch.where(data["attention_mask"][:, -response_length:].bool(), torch.log(torch.exp(old_log_prob) * (1-alpha) + mu_prob * alpha), ori_old_log_prob)
-
+                    """
 
                     advantages = data["advantages"]
 

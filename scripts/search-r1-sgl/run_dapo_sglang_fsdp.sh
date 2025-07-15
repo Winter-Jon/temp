@@ -12,13 +12,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # time=$(date +%Y-%m-%d-%H-%M-%S)
 
 # comment="DCremoved_IS_cloned_traj_ratio_BHIS_4_dynamic_filter"
-comment="ablation_only_dynamic_filter"
+comment="Full_Tech_prefix_index"
 
 # type="val_150steps"
-type="train"
+type="val_150steps"
 
-export BASE_MODEL='/workspace/modelsl/Qwen2.5-3B'
-export EXPERIMENT_NAME=qwen2.5-3b-${comment}-${type}
+export BASE_MODEL='/workspace/modelsl/Qwen2.5-7B'
+export EXPERIMENT_NAME=qwen2.5-7b-${comment}-${type}
 # export EXPERIMENT_NAME=dev-test
 
 search_r1_train_path=$HOME/data/search-r1-dataset/train.parquet
@@ -30,6 +30,9 @@ test_files="['$search_r1_test_path']"
 
 
 python3 -m verl.trainer.main_ppo \
+    dapo.enable=true \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -78,7 +81,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=8 \
-    trainer.val_before_train=false \
+    trainer.val_before_train=true \
+    trainer.val_only=true \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=100 \
@@ -86,7 +90,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps=1005 \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     trainer.validation_data_dir=verl_checkpoints/$EXPERIMENT_NAME/val_generations \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=/workspace/repository/verl/scripts/search-r1-sgl/verl_checkpoints/qwen2.5-7b-Full_Tech_prefix_index-train/global_step_150\
     reward_model.reward_manager=reward_manager \
     max_turns=5 \
     keep_ratio=0.12 \
@@ -98,6 +103,3 @@ python3 -m verl.trainer.main_ppo \
 
 #     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000 \
 #     critic.ppo_max_token_len_per_gpu=98304 \
-
-#     actor_rollout_ref.actor.clip_ratio_high=0.28 \
-#     actor_rollout_ref.actor.clip_ratio_low=0.2 \
