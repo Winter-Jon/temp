@@ -626,7 +626,6 @@ def compute_policy_loss(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     # return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, torch.gt(pg_losses2, pg_losses1) 
-    # NOTE: 这里先没有计算 dual clip 的比例
     return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(-1), torch.gt(pg_losses2, pg_losses1)
 
 
