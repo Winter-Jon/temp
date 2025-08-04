@@ -444,7 +444,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
-                    """
+
                     # NOTE: 根据重要性采样系数，修改 old_log_prob
                     # q(a|s) = (1-\alpha) * \pi_{old}(a|s) + \alpha * \mu(a|s)
                     # 其中，在插入的提示词上，\mu(prompt_0|s) = 1/30 , 在其他位置上，\mu(prompt_others|s) = 1/30 ，\mu(action|s) = old_log_prob
@@ -507,7 +507,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     ori_old_log_prob = old_log_prob.clone().detach()
                     old_log_prob = torch.where(data["attention_mask"][:, -response_length:].bool(), torch.log(torch.exp(old_log_prob) * (1-alpha) + mu_prob * alpha), ori_old_log_prob)
-                    """
+
 
                     advantages = data["advantages"]
 

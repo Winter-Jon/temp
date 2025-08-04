@@ -10,6 +10,7 @@ data:
   max_obs_length: 500
   revision_prob: 0
   structure_format_score: 0
+  seed: 20020717
 
   # Tokenizer class or path. If null, it will be inferred from the model.
   tokenizer: null

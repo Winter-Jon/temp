@@ -36,38 +36,104 @@ If I want to give the final answer, I should put the answer between <answer> and
 #     29: "Realizing potential gaps in logic or information."
 # }
 
+# random_15
 revision_prompts = {
     0: "<think> Perhaps I've overlooked critical points or slipped up in my logic.",
-    1: "<think> I wonder if vital information escaped my notice or if I made an error.",
-    2: "<think> There might be key gaps in my understanding or errors in reasoning.",
-    3: "<think> It's possible I've missed something important or misunderstood crucial details.",
-    4: "<think> I suspect errors crept in, or essential points went unnoticed.",
-    5: "<think> Maybe I've misjudged something important or neglected key facts.",
-    6: "<think> Reflecting now, I might have overlooked critical data or erred somewhere.",
-    7: "<think> Possibly, I've missed significant insights or made a mistake.",
-    8: "<think> I'm sensing a gap or error might be present in my recent reasoning.",
-    9: "<think> I could have misinterpreted important facts or overlooked necessary details.",
-    10: "<think> Aware that my reasoning might be flawed or lacking crucial points.",
-    11: "<think> I need to reconsider—I might've skipped vital information or erred.",
-    12: "<think> There's a chance my previous thinking has unnoticed mistakes or omissions.",
-    13: "<think> I feel there might be something critical I overlooked or misunderstood.",
-    14: "<think> Perhaps my earlier reasoning has hidden mistakes or missing information.",
-    15: "<think> Concerned I might have overlooked key aspects or made subtle errors.",
-    16: "<think> I might have unintentionally ignored essential details or misunderstood something.",
-    17: "<think> Revisiting carefully, perhaps errors or oversights went unnoticed earlier.",
-    18: "<think> Maybe important points slipped my attention, or I made a miscalculation.",
-    19: "<think> It's likely I've overlooked something crucial or stumbled in logic.",
-    20: "<think> Reflecting, I could've missed critical clues or made errors in judgment.",
-    21: "<think> Possibly, I misunderstood something fundamental or missed key evidence.",
-    22: "<think> Concerned about potential unnoticed mistakes or overlooked essential details.",
-    23: "<think> Perhaps my earlier step wasn't entirely accurate or lacked vital points.",
-    24: "<think> It's conceivable that I've neglected critical information or erred.",
-    25: "<think> Wondering if I've mistakenly dismissed something important or misunderstood it.",
-    26: "<think> Maybe my previous reasoning has blind spots or unnoticed errors.",
-    27: "<think> I'm doubting if crucial points were missed or mistakes made earlier.",
-    28: "<think> Feeling uncertain—perhaps critical details slipped past or were misunderstood.",
-    29: "<think> Recognizing possible gaps or missteps I didn't previously notice."
+    1: "<think> There might be key gaps in my understanding or errors in reasoning.",
+    2: "<think> Maybe I've misjudged something important or neglected key facts.",
+    3: "<think> Reflecting now, I might have overlooked critical data or erred somewhere.",
+    4: "<think> I'm sensing a gap or error might be present in my recent reasoning.",
+    5: "<think> Aware that my reasoning might be flawed or lacking crucial points.",
+    6: "<think> I need to reconsider—I might've skipped vital information or erred.",
+    7: "<think> There's a chance my previous thinking has unnoticed mistakes or omissions.",
+    8: "<think> Perhaps my earlier reasoning has hidden mistakes or missing information.",
+    9: "<think> I might have unintentionally ignored essential details or misunderstood something.",
+    10: "<think> Revisiting carefully, perhaps errors or oversights went unnoticed earlier.",
+    11: "<think> Maybe important points slipped my attention, or I made a miscalculation.",
+    12: "<think> Possibly, I misunderstood something fundamental or missed key evidence.",
+    13: "<think> Concerned about potential unnoticed mistakes or overlooked essential details.",
+    14: "<think> I'm doubting if crucial points were missed or mistakes made earlier.",
 }
+
+
+# random_5
+# revision_prompts = {
+#     0: "<think> I wonder if vital information escaped my notice or if I made an error.",
+#     1: "<think> I need to reconsider—I might've skipped vital information or erred.",
+#     2: "<think> There's a chance my previous thinking has unnoticed mistakes or omissions.",
+#     3: "<think> Perhaps my earlier reasoning has hidden mistakes or missing information.",
+#     4: "<think> It's conceivable that I've neglected critical information or erred.",
+# }
+
+# 原始
+# revision_prompts = {
+#     0: "<think> Perhaps I've overlooked critical points or slipped up in my logic.",
+#     1: "<think> I wonder if vital information escaped my notice or if I made an error.",
+#     2: "<think> There might be key gaps in my understanding or errors in reasoning.",
+#     3: "<think> It's possible I've missed something important or misunderstood crucial details.",
+#     4: "<think> I suspect errors crept in, or essential points went unnoticed.",
+#     5: "<think> Maybe I've misjudged something important or neglected key facts.",
+#     6: "<think> Reflecting now, I might have overlooked critical data or erred somewhere.",
+#     7: "<think> Possibly, I've missed significant insights or made a mistake.",
+#     8: "<think> I'm sensing a gap or error might be present in my recent reasoning.",
+#     9: "<think> I could have misinterpreted important facts or overlooked necessary details.",
+#     10: "<think> Aware that my reasoning might be flawed or lacking crucial points.",
+#     11: "<think> I need to reconsider—I might've skipped vital information or erred.",
+#     12: "<think> There's a chance my previous thinking has unnoticed mistakes or omissions.",
+#     13: "<think> I feel there might be something critical I overlooked or misunderstood.",
+#     14: "<think> Perhaps my earlier reasoning has hidden mistakes or missing information.",
+#     15: "<think> Concerned I might have overlooked key aspects or made subtle errors.",
+#     16: "<think> I might have unintentionally ignored essential details or misunderstood something.",
+#     17: "<think> Revisiting carefully, perhaps errors or oversights went unnoticed earlier.",
+#     18: "<think> Maybe important points slipped my attention, or I made a miscalculation.",
+#     19: "<think> It's likely I've overlooked something crucial or stumbled in logic.",
+#     20: "<think> Reflecting, I could've missed critical clues or made errors in judgment.",
+#     21: "<think> Possibly, I misunderstood something fundamental or missed key evidence.",
+#     22: "<think> Concerned about potential unnoticed mistakes or overlooked essential details.",
+#     23: "<think> Perhaps my earlier step wasn't entirely accurate or lacked vital points.",
+#     24: "<think> It's conceivable that I've neglected critical information or erred.",
+#     25: "<think> Wondering if I've mistakenly dismissed something important or misunderstood it.",
+#     26: "<think> Maybe my previous reasoning has blind spots or unnoticed errors.",
+#     27: "<think> I'm doubting if crucial points were missed or mistakes made earlier.",
+#     28: "<think> Feeling uncertain—perhaps critical details slipped past or were misunderstood.",
+#     29: "<think> Recognizing possible gaps or missteps I didn't previously notice."
+# }
+
+# o3_rephrase_30
+# revision_prompts = {
+#     0: "<think> Maybe I overlooked crucial points or my reasoning went off track.",
+#     1: "<think> I wonder if key facts escaped me or I erred in my logic.",
+#     2: "<think> There could be missing pieces I ignored or flaws in my argument.",
+#     3: "<think> It's possible I missed something vital or misread crucial details.",
+#     4: "<think> I might have let errors slip in or failed to notice important points.",
+#     5: "<think> Perhaps I misjudged something important or left out key information.",
+#     6: "<think> On reflection, I may have skipped critical data or reasoned incorrectly.",
+#     7: "<think> I could have missed significant insights or taken a wrong step.",
+#     8: "<think> I sense a gap in the facts or a slip in my logic.",
+#     9: "<think> I may have misinterpreted key facts or overlooked necessary details.",
+#     10: "<think> My reasoning might be shaky or missing crucial context.",
+#     11: "<think> I should revisit this—maybe I skipped vital info or made an error.",
+#     12: "<think> There may be unnoticed gaps or mistakes in what I just reasoned.",
+#     13: "<think> I suspect I overlooked or misunderstood something important.",
+#     14: "<think> My earlier logic may hide errors or omit essential points.",
+#     15: "<think> I may have missed key aspects or made subtle mistakes.",
+#     16: "<think> I might have ignored essential details or misread part of it.",
+#     17: "<think> On second look, oversights or errors may have slipped through.",
+#     18: "<think> Important points might have escaped me, or I miscalculated.",
+#     19: "<think> I likely missed something crucial or stumbled in my reasoning.",
+#     20: "<think> Thinking back, I could have overlooked clues or judged incorrectly.",
+#     21: "<think> Maybe I misunderstood a core idea or missed key evidence.",
+#     22: "<think> I'm concerned about hidden errors or overlooked essentials.",
+#     23: "<think> Perhaps that step wasn't fully accurate or lacked key details.",
+#     24: "<think> It's conceivable I neglected critical information or made a mistake.",
+#     25: "<think> I may have dismissed or misread something important.",
+#     26: "<think> My previous reasoning might contain blind spots or quiet errors.",
+#     27: "<think> I'm unsure whether I missed crucial points or made mistakes earlier.",
+#     28: "<think> I feel uneasy—critical details may have slipped by or been misread.",
+#     29: "<think> I recognize possible gaps or missteps I didn't catch before."
+# }
+
+
 
 action_prompts = {
     0: " Now I need to choose an action.",
