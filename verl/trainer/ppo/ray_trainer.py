@@ -555,9 +555,6 @@ def compute_data_metrics(batch, use_critic=True):
     return metrics
 
 def reorder_batch_dapo(config, batch, keep_ratio = None):
-    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
-    # 仅保留 trainer.train_batch * rollout.n_agent * 8%
-    # keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * config.keep_ratio)
     keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * (1 + keep_ratio))
     keep_num = keep_num - (keep_num % config.trainer.n_gpus_per_node)
     keep_num = keep_num - batch.batch['original_mask'].sum().item()
@@ -615,9 +612,6 @@ def reorder_batch_dapo(config, batch, keep_ratio = None):
     return batch
 
 def reorder_batch(config, batch, keep_ratio = None):
-    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
-    # 仅保留 trainer.train_batch * rollout.n_agent * 8%
-    # keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * config.keep_ratio)
     keep_num = int(config.data.train_batch_size * config.actor_rollout_ref.rollout.n_agent * keep_ratio)
     keep_num = keep_num - (keep_num % config.trainer.n_gpus_per_node)
     # old_log_prob = batch.batch["old_log_prob"].detach().cpu().numpy().mean(axis = 1)
@@ -1531,20 +1525,20 @@ class RayPPOTrainer:
                                 }
                             )
 
-                    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
+                    # NOTE: Trajectory Filter ------------------------------------------- >
                     ratio_keep = pd.Series(revision_accs).ewm(alpha=0.1,adjust=False).mean().iloc[-1]
                     batch = reorder_batch(self.config,batch, keep_ratio = ratio_keep)
                     metrics.update({
                         "revision/keep_ratio": ratio_keep,
                     })
 
-                    # NOTE: 记录克隆轨迹的数量和 token 占比，用于后续的 IS 计算
                     batch.meta_info["cloned_traj_num"] = batch.batch.batch_size[0] - batch.batch['original_mask'].sum().item()
                     batch.meta_info["cloned_traj_ratio"] = batch.meta_info["cloned_traj_num"] / batch.batch.batch_size[0]
                     revision_tokens = (batch.batch["component_mask"] == 5).sum().item()
                     action_tokens = (batch.batch["component_mask"] == 6).sum().item()
                     respones_tokens = (batch.batch["component_mask"] == 1).sum().item()
                     batch.meta_info["prompts_token_ratio"] =  (revision_tokens + action_tokens)/(revision_tokens + action_tokens +respones_tokens)
+                    # < --------------------------------------------------------------------
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1894,18 +1888,15 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     if self.config.dapo.dynamic_sampling.enable:
 
-                        # NOTE: 计算每个 prompt 的分数
                         metric_vals = reward_tensor.sum(dim=-1).tolist()
                         prompt_uid2metric_vals = defaultdict(list)
                         for uid, metric_val in zip(batch.non_tensor_batch["uid"].tolist(), metric_vals):
                             prompt_uid2metric_vals[uid].append(metric_val)
 
-                        # NOTE: 计算每个 prompt 的 std
                         prompt_uid2metric_std = {}
                         for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
-                        # 保留下 std 不为 0 的 prompt
                         kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
                         num_prompt_in_batch += len(kept_prompt_uids)
 
@@ -1914,7 +1905,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                             kept_prompt_uids = kept_prompt_uids[:-delete_size]
                             num_prompt_in_batch = self.config.data.train_batch_size
 
-                        # 保留下对应的轨迹
                         kept_traj_idxs = []
                         for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch["uid"]):
                             if traj_from_prompt_uid in kept_prompt_uids:
@@ -1936,7 +1926,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     meta_info[k] = v + new_batch.meta_info[k]
                                 else:
                                     meta_info[k] = v
-                            # TODO: 根据 左对齐或者右对齐，向最短的添加 pad 
+
                             # 'responses', 'responses_with_info_mask', 'component_mask', 'prompts', 'input_ids', 'attention_mask', 'info_mask', 'position_ids', 'original_mask'
                             for k in buffer_batch.batch.keys():
                                 if buffer_batch.batch[k].dim() == 2:
@@ -1970,7 +1960,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                                 value=0
                                             )
                                     else:
-                                        raise ValueError(f"未考虑到的 key: {k}")
+                                        raise ValueError(f"Not Considered key: {k}")
                                 else:
                                     if k not in ["original_mask"]:
                                         raise ValueError(f"Unsupported dimension for {k}: {buffer_batch.batch[k].dim()}")
@@ -2052,9 +2042,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 }
                             )
 
-                    # NOTE: 根据 old log prob 进行排序，去掉概率过低的轨迹
                     ratio_keep = pd.Series(revision_accs).ewm(alpha=0.1,adjust=False).mean().iloc[-1]
-                    # NOTE: 取个最小值，防止 OOM
                     ratio_keep = min(ratio_keep, self.config.keep_ratio)
                     batch = reorder_batch(self.config,batch, keep_ratio = ratio_keep)
                     metrics.update({
@@ -2063,7 +2051,6 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     self._balance_batch(batch, metrics=metrics)
 
-                    # NOTE: 记录克隆轨迹的数量和 token 占比，用于后续的 IS 计算
                     batch.meta_info["cloned_traj_num"] = batch.batch.batch_size[0] - batch.batch['original_mask'].sum().item()
                     batch.meta_info["cloned_traj_ratio"] = batch.meta_info["cloned_traj_num"] / batch.batch.batch_size[0]
                     revision_tokens = (batch.batch["component_mask"] == 5).sum().item()

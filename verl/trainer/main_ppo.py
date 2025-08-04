@@ -380,6 +380,10 @@ def create_rl_sampler(data_config, dataset):
     if data_config.shuffle:
         train_dataloader_generator = torch.Generator()
         train_dataloader_generator.manual_seed(data_config.get("seed", 1))
+        print('-'*100)
+        seed = data_config.get("seed", 1)
+        print(f"已经成功设置随机种子{seed}")
+        print('-'*100)
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
